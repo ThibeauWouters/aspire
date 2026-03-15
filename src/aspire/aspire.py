@@ -2,15 +2,17 @@ import copy
 import logging
 import multiprocessing as mp
 import pickle
+import warnings
 from contextlib import contextmanager
 from inspect import signature
+from pathlib import Path
 from typing import Any, Callable
 
 import h5py
 
 from .flows import get_flow_wrapper
 from .flows.base import Flow
-from .history import History
+from .history import FlowHistory, History
 from .samplers.base import Sampler
 from .samples import Samples
 from .transforms import (
@@ -234,6 +236,11 @@ class Aspire:
 
         if self.flow is None:
             self.init_flow()
+        elif getattr(self, "_skip_flow_training", False) and not overwrite:
+            logger.info(
+                "Skipping flow training because a checkpointed flow was loaded."
+            )
+            return FlowHistory()
 
         self.training_samples = samples
         logger.info(f"Training with {len(samples.x)} samples")
@@ -490,17 +497,6 @@ class Aspire:
                 kwargs.setdefault("checkpoint_file_path", checkpoint_path)
                 kwargs.setdefault("checkpoint_every", checkpoint_every)
             with AspireFile(checkpoint_path, "a") as h5_file:
-                if checkpoint_save_config:
-                    if "aspire_config" in h5_file:
-                        del h5_file["aspire_config"]
-                    self.save_config(
-                        h5_file,
-                        include_sampler_config=True,
-                        include_sample_calls=False,
-                    )
-                    saved_config = True
-                    if defaults is not None:
-                        defaults["saved_config"] = True
                 if (
                     self.flow is not None
                     and not saved_flow
@@ -529,8 +525,13 @@ class Aspire:
                         del h5_file["aspire_config"]
                     self.save_config(
                         h5_file,
-                        include_sampler_config=True,
-                        include_sample_calls=False,
+                        include_sampler_config=False,
+                    )
+                    if "sampler_config" in h5_file:
+                        del h5_file["sampler_config"]
+                    self.save_sampler_config(
+                        h5_file,
+                        include_sample_calls="last",
                     )
                     if defaults is not None:
                         defaults["saved_config"] = True
@@ -612,23 +613,15 @@ class Aspire:
             config_path=config_path,
         )
 
-        sampler_config = sampler_config or {}
-        sampler_config.pop("sampler_class", None)
-
-        if checkpoint_bytes is not None:
-            aspire._resume_from_default = checkpoint_bytes
-            aspire._resume_sampler_type = (
-                sampler
-                or saved_sampler_type
-                or (
-                    checkpoint_state.get("sampler")
-                    if checkpoint_state
-                    else None
-                )
-            )
-            aspire._resume_n_samples = n_samples
-            aspire._resume_overrides = resume_kwargs or {}
-            aspire._resume_sampler_config = sampler_config
+        aspire._set_resume_defaults(
+            checkpoint_bytes=checkpoint_bytes,
+            checkpoint_state=checkpoint_state,
+            sampler_config=sampler_config,
+            saved_sampler_type=saved_sampler_type,
+            n_samples=n_samples,
+            sampler=sampler,
+            resume_kwargs=resume_kwargs,
+        )
         aspire._checkpoint_defaults = {
             "path": file_path,
             "every": 1,
@@ -646,6 +639,7 @@ class Aspire:
         every: int = 1,
         save_config: bool = True,
         save_flow: bool = True,
+        resume: bool = False,
     ):
         """
         Context manager to auto-save checkpoints, config, and flow to a file.
@@ -653,6 +647,19 @@ class Aspire:
         Within the context, sample_posterior will default to writing checkpoints
         to the given path with the specified frequency, and will append config/flow
         after sampling.
+
+        Parameters
+        ----------
+        path : str
+            Path to save the checkpoint file.
+        every : int
+            Frequency (in number of sampler iterations) to save the checkpoint.
+        save_config : bool
+            Whether to save the Aspire configuration to the checkpoint file.
+        save_flow : bool
+            Whether to save the flow to the checkpoint file.
+        resume : bool
+            Whether to attempt to resume from an existing checkpoint at the path.
         """
         prev = getattr(self, "_checkpoint_defaults", None)
         self._checkpoint_defaults = {
@@ -663,9 +670,63 @@ class Aspire:
             "saved_config": False,
             "saved_flow": False,
         }
+        resume_attrs = [
+            "_resume_from_default",
+            "_resume_sampler_type",
+            "_resume_n_samples",
+            "_resume_overrides",
+            "_resume_sampler_config",
+            "_skip_flow_training",
+        ]
+        prev_resume_state = {
+            attr: getattr(self, attr)
+            for attr in resume_attrs
+            if hasattr(self, attr)
+        }
+        path = Path(path)
+        if resume and path.is_file():
+            logger.info(f"Resuming from checkpoint file at {path}")
+            (
+                checkpoint_bytes,
+                checkpoint_state,
+                sampler_config,
+                saved_sampler_type,
+                n_samples,
+                checkpoint_xp,
+            ) = self._load_resume_data(
+                path,
+                checkpoint_path="checkpoint",
+                checkpoint_dset="state",
+                config_path="aspire_config",
+            )
+            requested_n_samples = self._resume_n_samples_from_sampler_config(
+                sampler_config
+            )
+            if requested_n_samples is not None:
+                n_samples = requested_n_samples
+            self._load_flow_from_file(
+                path,
+                flow_path="flow",
+                required=False,
+            )
+            self._set_resume_defaults(
+                checkpoint_bytes=checkpoint_bytes,
+                checkpoint_state=checkpoint_state,
+                sampler_config=sampler_config,
+                saved_sampler_type=saved_sampler_type,
+                n_samples=n_samples,
+            )
+            self._skip_flow_training = self.flow is not None
+            if self.xp is None and checkpoint_xp is not None:
+                self.xp = checkpoint_xp
         try:
             yield self
         finally:
+            for attr in resume_attrs:
+                if attr in prev_resume_state:
+                    setattr(self, attr, prev_resume_state[attr])
+                elif hasattr(self, attr):
+                    delattr(self, attr)
             if prev is None:
                 if hasattr(self, "_checkpoint_defaults"):
                     delattr(self, "_checkpoint_defaults")
@@ -687,7 +748,7 @@ class Aspire:
         return PoolHandler(self, pool, **kwargs)
 
     def config_dict(
-        self, include_sampler_config: bool = True, **kwargs
+        self, include_sampler_config: bool = False, **kwargs
     ) -> dict:
         """Return a dictionary with the configuration of the aspire object.
 
@@ -695,7 +756,7 @@ class Aspire:
         ----------
         include_sampler_config : bool
             Whether to include the configuration of the sampler. Default is
-            True.
+            False.
         kwargs : dict
             Additional keyword arguments to pass to the :py:meth:`config_dict`
             method of the sampler.
@@ -716,9 +777,9 @@ class Aspire:
             "flow_kwargs": self.flow_kwargs,
             "eps": self.eps,
         }
-        if hasattr(self, "_last_sampler_type"):
-            config["sampler_type"] = self._last_sampler_type
         if include_sampler_config:
+            if hasattr(self, "_last_sampler_type"):
+                config["sampler_type"] = self._last_sampler_type
             if self.sampler is None:
                 raise ValueError("Sampler has not been initialized.")
             config["sampler_config"] = self.sampler.config_dict(**kwargs)
@@ -743,6 +804,39 @@ class Aspire:
             h5_file,
             path,
             self.config_dict(**kwargs),
+        )
+
+    def save_sampler_config(
+        self,
+        h5_file: h5py.File | AspireFile,
+        path: str = "sampler_config",
+        **kwargs,
+    ) -> None:
+        """Save the sampler configuration to an HDF5 file.
+
+        By default, this will save the configuration of the last sampler used in
+        a call to :py:meth:`sample_posterior`.
+        Set :code:`include_sample_class='all' to include all the calls to
+        :py:meth:`sample_posterior` and their corresponding sampler
+        configurations.
+
+        Parameters
+        ----------
+        h5_file : h5py.File
+            The HDF5 file to save the sampler configuration to.
+        path : str
+            The path in the HDF5 file to save the sampler configuration to.
+        kwargs : dict
+            Additional keyword arguments to pass to the :py:meth:`config_dict`
+            method of the sampler.
+        """
+        config = self.sampler.config_dict(**kwargs) if self.sampler else {}
+        if hasattr(self, "_last_sampler_type"):
+            config["sampler_type"] = self._last_sampler_type
+        recursively_save_to_h5_file(
+            h5_file,
+            path,
+            config,
         )
 
     def save_flow(self, h5_file: h5py.File, path="flow") -> None:
@@ -802,7 +896,186 @@ class Aspire:
 
     # --- Resume helpers ---
     @staticmethod
+    def _load_resume_data(
+        file_path: str,
+        checkpoint_path: str,
+        checkpoint_dset: str,
+        config_path: str,
+        sampler_config_path: str = "sampler_config",
+    ) -> tuple[
+        bytes | None, dict | None, dict | None, str | None, int | None, Any
+    ]:
+        """Load checkpoint bytes and saved resume metadata from file."""
+        with AspireFile(file_path, "r") as h5_file:
+            config_dict = (
+                load_from_h5_file(h5_file, config_path)
+                if config_path in h5_file
+                else None
+            )
+            standalone_sampler_config = (
+                load_from_h5_file(h5_file, sampler_config_path)
+                if sampler_config_path in h5_file
+                else None
+            )
+            try:
+                checkpoint_bytes = h5_file[checkpoint_path][checkpoint_dset][
+                    ...
+                ].tobytes()
+            except Exception:
+                logger.warning(
+                    "Checkpoint not found at %s/%s in %s; will resume without a checkpoint.",
+                    checkpoint_path,
+                    checkpoint_dset,
+                    file_path,
+                )
+                checkpoint_bytes = None
+
+        sampler_config = None
+        saved_sampler_type = None
+        used_legacy_sampler_config = False
+        if config_dict is not None:
+            saved_sampler_type = config_dict.get("sampler_type")
+            sampler_config = config_dict.get("sampler_config")
+            used_legacy_sampler_config = sampler_config is not None
+        if standalone_sampler_config is not None:
+            saved_sampler_type = (
+                saved_sampler_type
+                or standalone_sampler_config.get("sampler_type")
+            )
+            if sampler_config is None:
+                sampler_config = dict(standalone_sampler_config)
+                sampler_config.pop("sampler_type", None)
+                used_legacy_sampler_config = False
+        elif used_legacy_sampler_config:
+            warnings.warn(
+                (
+                    f"Loaded sampler metadata from legacy '{config_path}' "
+                    f"path in {file_path}; please migrate to "
+                    f"'{sampler_config_path}'."
+                ),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        n_samples = None
+        checkpoint_state = None
+        checkpoint_xp = None
+        if checkpoint_bytes is not None:
+            try:
+                checkpoint_state = pickle.loads(checkpoint_bytes)
+                samples_saved = (
+                    checkpoint_state.get("samples")
+                    if checkpoint_state
+                    else None
+                )
+                if samples_saved is not None:
+                    n_samples = len(samples_saved)
+                    if hasattr(samples_saved, "xp"):
+                        checkpoint_xp = samples_saved.xp
+            except Exception:
+                logger.warning(
+                    "Failed to decode checkpoint; proceeding without resume state."
+                )
+
+        return (
+            checkpoint_bytes,
+            checkpoint_state,
+            sampler_config,
+            saved_sampler_type,
+            n_samples,
+            checkpoint_xp,
+        )
+
+    def _set_resume_defaults(
+        self,
+        *,
+        checkpoint_bytes: bytes | None,
+        checkpoint_state: dict | None,
+        sampler_config: dict | None,
+        saved_sampler_type: str | None,
+        n_samples: int | None,
+        sampler: str | None = None,
+        resume_kwargs: dict | None = None,
+    ) -> None:
+        """Configure default resume state for future sample_posterior calls."""
+        if checkpoint_bytes is None:
+            return
+
+        sampler_config = sampler_config or {}
+        sampler_config.pop("sampler_class", None)
+
+        self._resume_from_default = checkpoint_bytes
+        self._resume_sampler_type = (
+            sampler
+            or saved_sampler_type
+            or (checkpoint_state.get("sampler") if checkpoint_state else None)
+        )
+        self._resume_n_samples = n_samples
+        self._resume_overrides = resume_kwargs or {}
+        self._resume_sampler_config = sampler_config
+
+    @staticmethod
+    def _resume_n_samples_from_sampler_config(
+        sampler_config: dict | None,
+    ) -> int | None:
+        """Infer the original sample_posterior n_samples from saved sample calls."""
+        if not isinstance(sampler_config, dict):
+            return None
+
+        sample_calls = sampler_config.get("sample_calls")
+        if not isinstance(sample_calls, dict):
+            return None
+
+        sample_args = sample_calls.get("args")
+        if hasattr(sample_args, "__len__") and not isinstance(
+            sample_args, (str, bytes, dict)
+        ):
+            if len(sample_args) == 0:
+                sample_args = None
+        else:
+            sample_args = None
+
+        if sample_args is not None:
+            try:
+                return int(sample_args[0])
+            except (TypeError, ValueError):
+                return None
+
+        sample_kwargs = sample_calls.get("kwargs")
+        if isinstance(sample_kwargs, dict) and "n_samples" in sample_kwargs:
+            try:
+                return int(sample_kwargs["n_samples"])
+            except (TypeError, ValueError):
+                return None
+
+        return None
+
+    def _load_flow_from_file(
+        self,
+        file_path: str,
+        flow_path: str = "flow",
+        required: bool = True,
+    ) -> bool:
+        """Load a saved flow from file onto the current Aspire instance."""
+        with AspireFile(file_path, "r") as h5_file:
+            if flow_path in h5_file:
+                logger.info(f"Loading flow from {flow_path} in {file_path}")
+                self.load_flow(h5_file, path=flow_path)
+                return True
+        if required:
+            raise ValueError(
+                f"Flow path '{flow_path}' not found in {file_path}"
+            )
+        logger.warning(
+            "Flow not found at %s in %s; continuing without loading a flow.",
+            flow_path,
+            file_path,
+        )
+        return False
+
+    @classmethod
     def _build_aspire_from_file(
+        cls,
         file_path: str,
         log_likelihood: Callable,
         log_prior: Callable,
@@ -818,18 +1091,20 @@ class Aspire:
                     f"Config path '{config_path}' not found in {file_path}"
                 )
             config_dict = load_from_h5_file(h5_file, config_path)
-            try:
-                checkpoint_bytes = h5_file[checkpoint_path][checkpoint_dset][
-                    ...
-                ].tobytes()
-            except Exception:
-                logger.warning(
-                    "Checkpoint not found at %s/%s in %s; will resume without a checkpoint.",
-                    checkpoint_path,
-                    checkpoint_dset,
-                    file_path,
-                )
-                checkpoint_bytes = None
+
+        (
+            checkpoint_bytes,
+            checkpoint_state,
+            sampler_config,
+            saved_sampler_type,
+            n_samples,
+            checkpoint_xp,
+        ) = Aspire._load_resume_data(
+            file_path=file_path,
+            checkpoint_path=checkpoint_path,
+            checkpoint_dset=checkpoint_dset,
+            config_path=config_path,
+        )
 
         sampler_config = config_dict.pop("sampler_config", None)
         saved_sampler_type = config_dict.pop("sampler_type", None)
@@ -840,33 +1115,20 @@ class Aspire:
 
         aspire = Aspire(**config_dict)
 
-        with AspireFile(file_path, "r") as h5_file:
-            if flow_path in h5_file:
-                logger.info(f"Loading flow from {flow_path} in {file_path}")
-                aspire.load_flow(h5_file, path=flow_path)
-            else:
-                raise ValueError(
-                    f"Flow path '{flow_path}' not found in {file_path}"
-                )
+        aspire._load_flow_from_file(
+            file_path,
+            flow_path=flow_path,
+            required=True,
+        )
 
-        n_samples = None
-        checkpoint_state = None
-        if checkpoint_bytes is not None:
-            try:
-                checkpoint_state = pickle.loads(checkpoint_bytes)
-                samples_saved = (
-                    checkpoint_state.get("samples")
-                    if checkpoint_state
-                    else None
-                )
-                if samples_saved is not None:
-                    n_samples = len(samples_saved)
-                    if aspire.xp is None and hasattr(samples_saved, "xp"):
-                        aspire.xp = samples_saved.xp
-            except Exception:
-                logger.warning(
-                    "Failed to decode checkpoint; proceeding without resume state."
-                )
+        if aspire.xp is None and checkpoint_xp is not None:
+            aspire.xp = checkpoint_xp
+
+        requested_n_samples = cls._resume_n_samples_from_sampler_config(
+            sampler_config
+        )
+        if requested_n_samples is not None:
+            n_samples = requested_n_samples
 
         return (
             aspire,

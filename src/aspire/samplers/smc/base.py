@@ -243,8 +243,19 @@ class SMCSampler(MCMCSampler):
         """
         resumed = resume_from is not None
         if resumed:
+            resume_from_printable = (
+                resume_from
+                if isinstance(resume_from, str)
+                else "checkpoint data"
+            )
+            logger.info(
+                f"Resuming SMC sampling from checkpoint: {resume_from_printable}"
+            )
             samples, beta, iterations = self.restore_from_checkpoint(
                 resume_from
+            )
+            logger.info(
+                f"Resumed SMC sampling at iteration {iterations} with beta={beta:.4f}"
             )
         else:
             samples = self.draw_initial_samples(n_samples)
@@ -312,6 +323,9 @@ class SMCSampler(MCMCSampler):
             last_beta = self.history.beta[-1] if self.history.beta else beta
             if last_beta >= 1.0:
                 run_smc_loop = False
+                logger.info(
+                    f"Checkpoint beta {last_beta:.4f} indicates SMC loop already completed, skipping to final mutation steps if needed"
+                )
 
         def maybe_checkpoint(force: bool = False):
             if checkpoint_callback is None:
@@ -401,6 +415,20 @@ class SMCSampler(MCMCSampler):
             f"Log evidence: {final_samples.log_evidence:.2f} +/- {final_samples.log_evidence_error:.2f}"
         )
         return final_samples
+
+    def config_dict(self, include_sample_calls: str | bool = "last") -> dict:
+        dictionary = super().config_dict(include_sample_calls)
+        # Remove resume_from from the config dict if present, since it may not
+        # be serializable and is not needed to reconstruct the sampler
+        if "sample_calls" in dictionary:
+            if include_sample_calls == "last":
+                dictionary["sample_calls"]["kwargs"].pop("resume_from", None)
+            else:
+                for call_id in dictionary["sample_calls"].keys():
+                    dictionary["sample_calls"][call_id]["kwargs"].pop(
+                        "resume_from", None
+                    )
+        return dictionary
 
     def mutate(self, particles):
         raise NotImplementedError
